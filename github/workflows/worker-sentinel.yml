@@ -159,3 +159,209 @@ jobs:
           COUNT=$(wc -l < results.txt)
           echo "✅ Nuclei findings: $COUNT"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+      
+      - name: 🤖 AI Analysis & Send Reports
+        run: |
+          TARGET="${{ steps.target.outputs.target }}"
+          SUBS="${{ steps.subdomains.outputs.count }}"
+          LIVE="${{ steps.http.outputs.count }}"
+          URLS="${{ steps.crawl.outputs.count }}"
+          VULN="${{ steps.nuclei.outputs.count }}"
+          ENABLE_AI="${{ steps.target.outputs.enable_ai }}"
+          
+          # ONLY send notification if vulnerabilities found
+          if [ "$VULN" -gt "0" ]; then
+            # Send summary alert
+            curl -H "Content-Type: application/json" \
+                 -d '{
+                   "embeds": [{
+                     "title": "🚨 Vulnerabilities Found!",
+                     "description": "**Target:** '"$TARGET"'\n**Vulnerabilities:** '"$VULN"'",
+                     "color": 15158332,
+                     "fields": [
+                       {"name": "🔍 Subdomains", "value": "'"$SUBS"'", "inline": true},
+                       {"name": "🌐 Live", "value": "'"$LIVE"'", "inline": true},
+                       {"name": "🕷️ URLs", "value": "'"$URLS"'", "inline": true},
+                       {"name": "🐛 Findings", "value": "'"$VULN"'", "inline": true}
+                     ],
+                     "footer": {"text": "Digital Sentinel ULTIMATE | '"$(date)"'"}
+                   }]
+                 }' \
+                 ${{ secrets.DISCORD_WEBHOOK_URL }} 2>/dev/null || true
+            
+            sleep 2
+            
+            # Send detailed vulnerability reports with AI analysis
+            if [ -f nuclei.json ] && [ -s nuclei.json ]; then
+              while IFS= read -r line; do
+                VULN_NAME=$(echo "$line" | jq -r '.info.name // "Unknown"')
+                VULN_SEVERITY=$(echo "$line" | jq -r '.info.severity // "info"' | tr '[:lower:]' '[:upper:]')
+                VULN_TYPE=$(echo "$line" | jq -r '.info.tags[0] // "unknown"')
+                VULN_URL=$(echo "$line" | jq -r '."matched-at" // .host // "Unknown"')
+                VULN_DESC=$(echo "$line" | jq -r '.info.description // "No description"' | head -c 500)
+                VULN_CVSS=$(echo "$line" | jq -r '.info.classification."cvss-score" // "N/A"')
+                VULN_CWE=$(echo "$line" | jq -r '.info.classification."cwe-id"[0] // ""')
+                MATCHER=$(echo "$line" | jq -r '."matcher-name" // "N/A"')
+                CURL_CMD=$(echo "$line" | jq -r '."curl-command" // "N/A"' | head -c 500)
+                EXTRACTED=$(echo "$line" | jq -r '.["extracted-results"][0] // "N/A"' | head -c 200)
+                
+                case "$VULN_SEVERITY" in
+                  CRITICAL) SEVERITY_COLOR=10038562 ;;
+                  HIGH) SEVERITY_COLOR=15158332 ;;
+                  MEDIUM) SEVERITY_COLOR=16098851 ;;
+                  LOW) SEVERITY_COLOR=16776960 ;;
+                  *) SEVERITY_COLOR=9807270 ;;
+                esac
+                
+                # AI Analysis using Gemini
+                AI_ANALYSIS="N/A"
+                if [ "$ENABLE_AI" == "true" ] && [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+                  AI_PROMPT="Analyze this vulnerability for bug bounty submission:
+Name: $VULN_NAME
+Type: $VULN_TYPE
+Severity: $VULN_SEVERITY
+URL: $VULN_URL
+Description: $VULN_DESC
+
+Provide:
+1. Impact assessment (2-3 sentences)
+2. Exploitation difficulty (Easy/Medium/Hard)
+3. Bug bounty value estimate (Low/Medium/High/Critical)
+4. Key points for report"
+                  
+                  AI_RESPONSE=$(curl -s -X POST \
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "contents": [{
+                        "parts": [{
+                          "text": "'"${AI_PROMPT//\"/\\\"}"'"
+                        }]
+                      }],
+                      "generationConfig": {
+                        "temperature": 0.7,
+                        "maxOutputTokens": 500
+                      }
+                    }' 2>/dev/null || echo "")
+                  
+                  if [ -n "$AI_RESPONSE" ]; then
+                    AI_ANALYSIS=$(echo "$AI_RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "N/A"' | head -c 800)
+                  fi
+                fi
+                
+                REPORT="**🚨 VULNERABILITY REPORT**\n\n"
+                REPORT+="**📋 BASIC INFORMATION**\n"
+                REPORT+="• Target: $TARGET\n"
+                REPORT+="• Name: $VULN_NAME\n"
+                REPORT+="• Type: $VULN_TYPE\n"
+                REPORT+="• Severity: $VULN_SEVERITY\n"
+                REPORT+="• CVSS: $VULN_CVSS\n"
+                if [ -n "$VULN_CWE" ]; then
+                  REPORT+="• CWE: CWE-$VULN_CWE\n"
+                fi
+                REPORT+="\n**🔗 AFFECTED URL**\n$VULN_URL\n"
+                REPORT+="\n**📝 DESCRIPTION**\n$VULN_DESC\n"
+                REPORT+="\n**🔍 PROOF OF CONCEPT**\n"
+                REPORT+="• Matcher: $MATCHER\n"
+                if [ "$EXTRACTED" != "N/A" ]; then
+                  REPORT+="• Extracted: \`$EXTRACTED\`\n"
+                fi
+                if [ "$CURL_CMD" != "N/A" ]; then
+                  REPORT+="• cURL: \`${CURL_CMD:0:200}...\`\n"
+                fi
+                
+                if [ "$AI_ANALYSIS" != "N/A" ]; then
+                  REPORT+="\n**🤖 AI ANALYSIS**\n${AI_ANALYSIS:0:600}\n"
+                fi
+                
+                REPORT+="\n**💡 REMEDIATION**\n"
+                
+                case "$VULN_TYPE" in
+                  *xss*)
+                    REPORT+="1. Input Validation: Validate and sanitize all user inputs\n"
+                    REPORT+="2. Output Encoding: Encode output before rendering\n"
+                    REPORT+="3. CSP: Implement Content Security Policy\n"
+                    REPORT+="4. HTTPOnly: Set HTTPOnly flag on cookies"
+                    ;;
+                  *sql*)
+                    REPORT+="1. Parameterized Queries: Use prepared statements\n"
+                    REPORT+="2. Input Validation: Sanitize all inputs\n"
+                    REPORT+="3. Least Privilege: Minimum database permissions\n"
+                    REPORT+="4. WAF: Implement Web Application Firewall"
+                    ;;
+                  *rce*|*command*)
+                    REPORT+="1. Input Validation: Strictly validate inputs\n"
+                    REPORT+="2. Disable Functions: Disable dangerous functions\n"
+                    REPORT+="3. Sandboxing: Run in sandboxed environment\n"
+                    REPORT+="4. Update: Keep software updated"
+                    ;;
+                  *ssrf*)
+                    REPORT+="1. Whitelist: Implement URL whitelist\n"
+                    REPORT+="2. Network Segmentation: Isolate internal services\n"
+                    REPORT+="3. Input Validation: Validate all URLs\n"
+                    REPORT+="4. Disable Redirects: Disable automatic redirects"
+                    ;;
+                  *lfi*|*rfi*)
+                    REPORT+="1. Path Validation: Validate file paths\n"
+                    REPORT+="2. Whitelist: Use file whitelist\n"
+                    REPORT+="3. Disable Functions: Disable include/require\n"
+                    REPORT+="4. Chroot: Use chroot jail"
+                    ;;
+                  *)
+                    REPORT+="1. Follow OWASP security best practices\n"
+                    REPORT+="2. Regular security audits\n"
+                    REPORT+="3. Keep software updated\n"
+                    REPORT+="4. Security training for developers"
+                    ;;
+                esac
+                
+                REPORT+="\n\n**📅 METADATA**\n"
+                REPORT+="• Discovered: $(date -u '+%Y-%m-%d %H:%M:%S UTC')\n"
+                REPORT+="• Scanner: Digital Sentinel ULTIMATE v2.0\n"
+                REPORT+="• Scan ID: ${{ github.run_id }}\n"
+                REPORT+="• AI Enhanced: $ENABLE_AI\n"
+                REPORT+="\n⚠️ **Ready for Bug Bounty Submission** ✅"
+                
+                curl -H "Content-Type: application/json" \
+                     -d '{
+                       "embeds": [{
+                         "title": "🚨 '"$VULN_NAME"'",
+                         "description": "'"$(echo "$REPORT" | sed 's/"/\\"/g')"'",
+                         "color": '"$SEVERITY_COLOR"',
+                         "footer": {"text": "Digital Sentinel ULTIMATE | Bug Bounty Ready"},
+                         "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+                       }]
+                     }' \
+                     ${{ secrets.DISCORD_WEBHOOK_URL }} 2>/dev/null || true
+                
+                sleep 2
+              done < nuclei.json
+            fi
+          else
+            echo "✅ No vulnerabilities found - skipping Discord notification"
+          fi
+      
+      - name: 📊 Summary
+        run: |
+          TARGET="${{ steps.target.outputs.target }}"
+          SUBS="${{ steps.subdomains.outputs.count }}"
+          LIVE="${{ steps.http.outputs.count }}"
+          URLS="${{ steps.crawl.outputs.count }}"
+          VULN="${{ steps.nuclei.outputs.count }}"
+          ENABLE_AI="${{ steps.target.outputs.enable_ai }}"
+          
+          echo "## 🔥 Scan Complete: $TARGET" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔍 Subdomains: $SUBS" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 Live: $LIVE" >> $GITHUB_STEP_SUMMARY
+          echo "- 🕷️ URLs: $URLS" >> $GITHUB_STEP_SUMMARY
+          echo "- 🐛 Vulnerabilities: $VULN" >> $GITHUB_STEP_SUMMARY
+          echo "- 🤖 AI Analysis: $ENABLE_AI" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$VULN" -gt "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📋 **Detailed reports sent to Discord with AI analysis**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **No vulnerabilities found - no Discord notification sent**" >> $GITHUB_STEP_SUMMARY
+          fi
