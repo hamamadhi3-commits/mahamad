@@ -26,6 +26,15 @@ on:
         options:
           - 'true'
           - 'false'
+      notification_mode:
+        description: 'Notification mode'
+        required: false
+        default: 'vulnerabilities_only'
+        type: choice
+        options:
+          - 'all'
+          - 'vulnerabilities_only'
+          - 'critical_only'
 
 jobs:
   scan:
@@ -40,28 +49,45 @@ jobs:
             TARGET="${{ github.event.client_payload.target }}"
             INTENSITY="${{ github.event.client_payload.intensity }}"
             ENABLE_AI="${{ github.event.client_payload.enable_ai }}"
+            NOTIFICATION_MODE="${{ github.event.client_payload.notification_mode }}"
           else
             TARGET="${{ github.event.inputs.target }}"
             INTENSITY="${{ github.event.inputs.intensity }}"
             ENABLE_AI="${{ github.event.inputs.enable_ai }}"
+            NOTIFICATION_MODE="${{ github.event.inputs.notification_mode }}"
           fi
+          
+          TARGET=$(echo "$TARGET" | sed 's/https\?:\/\///' | sed 's/\/.*//')
+          
           echo "target=$TARGET" >> $GITHUB_OUTPUT
           echo "intensity=${INTENSITY:-2}" >> $GITHUB_OUTPUT
           echo "enable_ai=${ENABLE_AI:-true}" >> $GITHUB_OUTPUT
-          echo "🎯 Target: $TARGET | Intensity: ${INTENSITY:-2} | AI: ${ENABLE_AI:-true}"
+          echo "notification_mode=${NOTIFICATION_MODE:-vulnerabilities_only}" >> $GITHUB_OUTPUT
+          echo "scan_id=$(date +%s)" >> $GITHUB_OUTPUT
+          
+          echo "🎯 Target: $TARGET"
+          echo "⚡ Intensity: ${INTENSITY:-2}"
+          echo "🤖 AI: ${ENABLE_AI:-true}"
+          echo "🔔 Mode: ${NOTIFICATION_MODE:-vulnerabilities_only}"
       
       - name: 🔧 Install Tools
         run: |
-          wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz
-          sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-          export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
-          echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
+          echo "📦 Installing security tools..."
           
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest &
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest &
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest &
-          go install -v github.com/projectdiscovery/katana/cmd/katana@latest &
-          wait
+          # Subfinder
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          
+          # HTTPX
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          
+          # Katana
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          
+          # Nuclei
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          
+          # Add to PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
           
           echo "✅ Tools installed"
       
@@ -71,6 +97,9 @@ jobs:
           TARGET="${{ steps.target.outputs.target }}"
           INTENSITY="${{ steps.target.outputs.intensity }}"
           
+          echo "🔍 Discovering subdomains for $TARGET..."
+          
+          # Configure timeout based on intensity
           if [ "$INTENSITY" -ge "3" ]; then
             TIMEOUT=10
           elif [ "$INTENSITY" -ge "2" ]; then
@@ -79,69 +108,116 @@ jobs:
             TIMEOUT=3
           fi
           
-          subfinder -d $TARGET -silent -max-time $TIMEOUT -o subs.txt 2>/dev/null || echo "$TARGET" > subs.txt
+          # Run subfinder
+          subfinder -d "$TARGET" -silent -timeout $TIMEOUT -o subs.txt 2>/dev/null || touch subs.txt
           
-          # Add target itself if not found
-          echo "$TARGET" >> subs.txt
-          echo "www.$TARGET" >> subs.txt
+          # Fallback if no subdomains found
+          if [ ! -s subs.txt ]; then
+            echo "⚠️ No subdomains found, using target itself"
+            echo "$TARGET" > subs.txt
+            echo "www.$TARGET" >> subs.txt
+            echo "api.$TARGET" >> subs.txt
+            echo "mail.$TARGET" >> subs.txt
+            echo "dev.$TARGET" >> subs.txt
+            echo "staging.$TARGET" >> subs.txt
+            echo "admin.$TARGET" >> subs.txt
+          fi
           
+          # Clean and deduplicate
           sort -u subs.txt -o subs.txt
+          
           COUNT=$(wc -l < subs.txt)
-          echo "✅ Subdomains: $COUNT"
+          echo "✅ Subdomains found: $COUNT"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          head -20 subs.txt
       
       - name: 🌐 HTTP Probing
         id: http
         run: |
           INTENSITY="${{ steps.target.outputs.intensity }}"
           
+          echo "🌐 Probing HTTP services..."
+          
+          # Configure threads based on intensity
           if [ "$INTENSITY" -ge "3" ]; then
             THREADS=50
+            TIMEOUT=15
           elif [ "$INTENSITY" -ge "2" ]; then
             THREADS=30
+            TIMEOUT=10
           else
             THREADS=20
+            TIMEOUT=5
           fi
           
-          cat subs.txt | httpx -silent -timeout 10 -threads $THREADS -follow-redirects -o live.txt 2>/dev/null || cp subs.txt live.txt
+          # Run httpx
+          cat subs.txt | httpx -silent -threads $THREADS -timeout $TIMEOUT \
+            -follow-redirects -status-code -title -tech-detect \
+            -o live.txt 2>/dev/null || touch live.txt
           
-          # If no live hosts, try adding http/https
+          # Fallback if no live hosts
           if [ ! -s live.txt ]; then
             TARGET="${{ steps.target.outputs.target }}"
+            echo "⚠️ No live hosts found, trying direct URLs"
             echo "http://$TARGET" > live.txt
             echo "https://$TARGET" >> live.txt
           fi
           
+          # Clean URLs
+          sed -i 's/ .*//' live.txt
+          sort -u live.txt -o live.txt
+          
           COUNT=$(wc -l < live.txt)
           echo "✅ Live hosts: $COUNT"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          head -20 live.txt
       
-      - name: 🕷️ Crawling & URL Discovery
+      - name: 🕷️ Web Crawling
         id: crawl
         run: |
           INTENSITY="${{ steps.target.outputs.intensity }}"
           
+          echo "🕷️ Crawling for URLs..."
+          
+          # Configure depth based on intensity
           if [ "$INTENSITY" -ge "3" ]; then
             DEPTH=3
+            MAX_PAGES=500
           elif [ "$INTENSITY" -ge "2" ]; then
             DEPTH=2
+            MAX_PAGES=200
           else
             DEPTH=1
+            MAX_PAGES=50
           fi
           
-          cat live.txt | head -5 | katana -silent -depth $DEPTH -timeout 10 -o urls.txt 2>/dev/null || cp live.txt urls.txt
+          # Run katana (limit to first 5 hosts to avoid timeout)
+          cat live.txt | head -5 | katana -silent -depth $DEPTH \
+            -js-crawl -timeout 10 -o urls.txt 2>/dev/null || cp live.txt urls.txt
+          
+          # Combine with live hosts
+          cat live.txt >> urls.txt
+          sort -u urls.txt -o urls.txt
           
           COUNT=$(wc -l < urls.txt)
           echo "✅ URLs discovered: $COUNT"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          head -20 urls.txt
       
-      - name: 🔎 Nuclei Scan
+      - name: 🔎 Nuclei Vulnerability Scan
         id: nuclei
         run: |
           INTENSITY="${{ steps.target.outputs.intensity }}"
           
+          echo "🔎 Scanning for vulnerabilities..."
+          
+          # Update templates
           nuclei -update-templates -silent 2>/dev/null || true
           
+          # Configure severity and rate limit based on intensity
           if [ "$INTENSITY" -ge "3" ]; then
             SEV="critical,high,medium,low,info"
             RATE=150
@@ -153,14 +229,29 @@ jobs:
             RATE=50
           fi
           
-          cat live.txt | nuclei -silent -severity $SEV -timeout 15 -rate-limit $RATE -json -o nuclei.json 2>/dev/null || touch nuclei.json
-          cat live.txt | nuclei -silent -severity $SEV -timeout 15 -rate-limit $RATE -o results.txt 2>/dev/null || touch results.txt
+          # Run nuclei
+          cat live.txt | nuclei -silent -severity $SEV -timeout 15 \
+            -rate-limit $RATE -json -o nuclei.json 2>/dev/null || touch nuclei.json
           
-          COUNT=$(wc -l < results.txt)
-          echo "✅ Nuclei findings: $COUNT"
+          cat live.txt | nuclei -silent -severity $SEV -timeout 15 \
+            -rate-limit $RATE -o results.txt 2>/dev/null || touch results.txt
+          
+          # Count vulnerabilities
+          if [ -s nuclei.json ]; then
+            COUNT=$(wc -l < nuclei.json)
+          else
+            COUNT=0
+          fi
+          
+          echo "✅ Vulnerabilities found: $COUNT"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$COUNT" -gt "0" ]; then
+            echo "📋 Sample findings:"
+            head -5 results.txt
+          fi
       
-      - name: 🤖 AI Analysis & Send Reports
+      - name: 🤖 AI Analysis & Discord Reporting
         run: |
           TARGET="${{ steps.target.outputs.target }}"
           SUBS="${{ steps.subdomains.outputs.count }}"
@@ -168,167 +259,127 @@ jobs:
           URLS="${{ steps.crawl.outputs.count }}"
           VULN="${{ steps.nuclei.outputs.count }}"
           ENABLE_AI="${{ steps.target.outputs.enable_ai }}"
+          NOTIFICATION_MODE="${{ steps.target.outputs.notification_mode }}"
+          SCAN_ID="${{ steps.target.outputs.scan_id }}"
           
-          # ONLY send notification if vulnerabilities found
-          if [ "$VULN" -gt "0" ]; then
-            # Send summary alert
+          # Determine if we should send notification
+          SHOULD_NOTIFY=false
+          
+          if [ "$NOTIFICATION_MODE" = "all" ]; then
+            SHOULD_NOTIFY=true
+          elif [ "$NOTIFICATION_MODE" = "critical_only" ] && [ "$VULN" -gt "0" ]; then
+            # Check if there are critical/high vulns
+            if grep -q '"severity":"critical"\|"severity":"high"' nuclei.json 2>/dev/null; then
+              SHOULD_NOTIFY=true
+            fi
+          elif [ "$NOTIFICATION_MODE" = "vulnerabilities_only" ] && [ "$VULN" -gt "0" ]; then
+            SHOULD_NOTIFY=true
+          fi
+          
+          if [ "$SHOULD_NOTIFY" = "true" ]; then
+            echo "📤 Sending Discord notification..."
+            
+            # Determine color based on vulnerabilities
+            if [ "$VULN" -gt "0" ]; then
+              COLOR=15158332  # Red
+              TITLE="🚨 Vulnerabilities Found!"
+            else
+              COLOR=5763719   # Green
+              TITLE="✅ Scan Complete - No Vulnerabilities"
+            fi
+            
+            # Send summary
             curl -H "Content-Type: application/json" \
                  -d '{
                    "embeds": [{
-                     "title": "🚨 Vulnerabilities Found!",
-                     "description": "**Target:** '"$TARGET"'\n**Vulnerabilities:** '"$VULN"'",
-                     "color": 15158332,
+                     "title": "'"$TITLE"'",
+                     "description": "**Target:** '"$TARGET"'\n**Scan ID:** '"$SCAN_ID"'",
+                     "color": '"$COLOR"',
                      "fields": [
                        {"name": "🔍 Subdomains", "value": "'"$SUBS"'", "inline": true},
-                       {"name": "🌐 Live", "value": "'"$LIVE"'", "inline": true},
+                       {"name": "🌐 Live Hosts", "value": "'"$LIVE"'", "inline": true},
                        {"name": "🕷️ URLs", "value": "'"$URLS"'", "inline": true},
-                       {"name": "🐛 Findings", "value": "'"$VULN"'", "inline": true}
+                       {"name": "🐛 Vulnerabilities", "value": "'"$VULN"'", "inline": true}
                      ],
-                     "footer": {"text": "Digital Sentinel ULTIMATE | '"$(date)"'"}
+                     "footer": {"text": "Digital Sentinel ULTIMATE"},
+                     "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
                    }]
                  }' \
                  ${{ secrets.DISCORD_WEBHOOK_URL }} 2>/dev/null || true
             
             sleep 2
             
-            # Send detailed vulnerability reports with AI analysis
-            if [ -f nuclei.json ] && [ -s nuclei.json ]; then
+            # Send detailed vulnerability reports
+            if [ "$VULN" -gt "0" ] && [ -s nuclei.json ]; then
+              echo "📋 Sending detailed vulnerability reports..."
+              
               while IFS= read -r line; do
-                VULN_NAME=$(echo "$line" | jq -r '.info.name // "Unknown"')
-                VULN_SEVERITY=$(echo "$line" | jq -r '.info.severity // "info"' | tr '[:lower:]' '[:upper:]')
-                VULN_TYPE=$(echo "$line" | jq -r '.info.tags[0] // "unknown"')
-                VULN_URL=$(echo "$line" | jq -r '."matched-at" // .host // "Unknown"')
-                VULN_DESC=$(echo "$line" | jq -r '.info.description // "No description"' | head -c 500)
-                VULN_CVSS=$(echo "$line" | jq -r '.info.classification."cvss-score" // "N/A"')
-                VULN_CWE=$(echo "$line" | jq -r '.info.classification."cwe-id"[0] // ""')
-                MATCHER=$(echo "$line" | jq -r '."matcher-name" // "N/A"')
-                CURL_CMD=$(echo "$line" | jq -r '."curl-command" // "N/A"' | head -c 500)
-                EXTRACTED=$(echo "$line" | jq -r '.["extracted-results"][0] // "N/A"' | head -c 200)
+                # Parse JSON
+                VULN_NAME=$(echo "$line" | grep -o '"template-id":"[^"]*"' | cut -d'"' -f4 || echo "Unknown")
+                VULN_TYPE=$(echo "$line" | grep -o '"type":"[^"]*"' | cut -d'"' -f4 || echo "Unknown")
+                SEVERITY=$(echo "$line" | grep -o '"severity":"[^"]*"' | cut -d'"' -f4 || echo "info")
+                MATCHED_AT=$(echo "$line" | grep -o '"matched-at":"[^"]*"' | cut -d'"' -f4 || echo "Unknown")
+                DESCRIPTION=$(echo "$line" | grep -o '"description":"[^"]*"' | cut -d'"' -f4 || echo "No description")
                 
-                case "$VULN_SEVERITY" in
-                  CRITICAL) SEVERITY_COLOR=10038562 ;;
-                  HIGH) SEVERITY_COLOR=15158332 ;;
-                  MEDIUM) SEVERITY_COLOR=16098851 ;;
-                  LOW) SEVERITY_COLOR=16776960 ;;
-                  *) SEVERITY_COLOR=9807270 ;;
+                # Severity color
+                case "$SEVERITY" in
+                  critical) SEV_COLOR=10038562 ;;
+                  high) SEV_COLOR=15158332 ;;
+                  medium) SEV_COLOR=16098851 ;;
+                  low) SEV_COLOR=16776960 ;;
+                  *) SEV_COLOR=9807270 ;;
                 esac
                 
-                # AI Analysis using Gemini
-                AI_ANALYSIS="N/A"
-                if [ "$ENABLE_AI" == "true" ] && [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
-                  AI_PROMPT="Analyze this vulnerability for bug bounty submission:
-Name: $VULN_NAME
+                # AI Analysis
+                AI_ANALYSIS=""
+                if [ "$ENABLE_AI" = "true" ] && [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+                  echo "🤖 Running AI analysis for $VULN_NAME..."
+                  
+                  AI_PROMPT="You are a senior security researcher. Analyze this vulnerability briefly (max 200 words):
+
+Vulnerability: $VULN_NAME
 Type: $VULN_TYPE
-Severity: $VULN_SEVERITY
-URL: $VULN_URL
-Description: $VULN_DESC
+Severity: $SEVERITY
+URL: $MATCHED_AT
 
 Provide:
-1. Impact assessment (2-3 sentences)
+1. Impact (2-3 sentences)
 2. Exploitation difficulty (Easy/Medium/Hard)
-3. Bug bounty value estimate (Low/Medium/High/Critical)
-4. Key points for report"
+3. Bug bounty value estimate
+4. Key recommendation
+
+Be concise and actionable."
                   
-                  AI_RESPONSE=$(curl -s -X POST \
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
+                  AI_RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
                     -H "Content-Type: application/json" \
                     -d '{
                       "contents": [{
-                        "parts": [{
-                          "text": "'"${AI_PROMPT//\"/\\\"}"'"
-                        }]
+                        "parts": [{"text": "'"${AI_PROMPT}"'"}]
                       }],
                       "generationConfig": {
                         "temperature": 0.7,
                         "maxOutputTokens": 500
                       }
-                    }' 2>/dev/null || echo "")
+                    }' 2>/dev/null | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
                   
                   if [ -n "$AI_RESPONSE" ]; then
-                    AI_ANALYSIS=$(echo "$AI_RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "N/A"' | head -c 800)
+                    AI_ANALYSIS="\n\n**🤖 AI Security Analysis:**\n$AI_RESPONSE"
                   fi
                 fi
                 
-                REPORT="**🚨 VULNERABILITY REPORT**\n\n"
-                REPORT+="**📋 BASIC INFORMATION**\n"
-                REPORT+="• Target: $TARGET\n"
-                REPORT+="• Name: $VULN_NAME\n"
-                REPORT+="• Type: $VULN_TYPE\n"
-                REPORT+="• Severity: $VULN_SEVERITY\n"
-                REPORT+="• CVSS: $VULN_CVSS\n"
-                if [ -n "$VULN_CWE" ]; then
-                  REPORT+="• CWE: CWE-$VULN_CWE\n"
-                fi
-                REPORT+="\n**🔗 AFFECTED URL**\n$VULN_URL\n"
-                REPORT+="\n**📝 DESCRIPTION**\n$VULN_DESC\n"
-                REPORT+="\n**🔍 PROOF OF CONCEPT**\n"
-                REPORT+="• Matcher: $MATCHER\n"
-                if [ "$EXTRACTED" != "N/A" ]; then
-                  REPORT+="• Extracted: \`$EXTRACTED\`\n"
-                fi
-                if [ "$CURL_CMD" != "N/A" ]; then
-                  REPORT+="• cURL: \`${CURL_CMD:0:200}...\`\n"
-                fi
-                
-                if [ "$AI_ANALYSIS" != "N/A" ]; then
-                  REPORT+="\n**🤖 AI ANALYSIS**\n${AI_ANALYSIS:0:600}\n"
-                fi
-                
-                REPORT+="\n**💡 REMEDIATION**\n"
-                
-                case "$VULN_TYPE" in
-                  *xss*)
-                    REPORT+="1. Input Validation: Validate and sanitize all user inputs\n"
-                    REPORT+="2. Output Encoding: Encode output before rendering\n"
-                    REPORT+="3. CSP: Implement Content Security Policy\n"
-                    REPORT+="4. HTTPOnly: Set HTTPOnly flag on cookies"
-                    ;;
-                  *sql*)
-                    REPORT+="1. Parameterized Queries: Use prepared statements\n"
-                    REPORT+="2. Input Validation: Sanitize all inputs\n"
-                    REPORT+="3. Least Privilege: Minimum database permissions\n"
-                    REPORT+="4. WAF: Implement Web Application Firewall"
-                    ;;
-                  *rce*|*command*)
-                    REPORT+="1. Input Validation: Strictly validate inputs\n"
-                    REPORT+="2. Disable Functions: Disable dangerous functions\n"
-                    REPORT+="3. Sandboxing: Run in sandboxed environment\n"
-                    REPORT+="4. Update: Keep software updated"
-                    ;;
-                  *ssrf*)
-                    REPORT+="1. Whitelist: Implement URL whitelist\n"
-                    REPORT+="2. Network Segmentation: Isolate internal services\n"
-                    REPORT+="3. Input Validation: Validate all URLs\n"
-                    REPORT+="4. Disable Redirects: Disable automatic redirects"
-                    ;;
-                  *lfi*|*rfi*)
-                    REPORT+="1. Path Validation: Validate file paths\n"
-                    REPORT+="2. Whitelist: Use file whitelist\n"
-                    REPORT+="3. Disable Functions: Disable include/require\n"
-                    REPORT+="4. Chroot: Use chroot jail"
-                    ;;
-                  *)
-                    REPORT+="1. Follow OWASP security best practices\n"
-                    REPORT+="2. Regular security audits\n"
-                    REPORT+="3. Keep software updated\n"
-                    REPORT+="4. Security training for developers"
-                    ;;
-                esac
-                
-                REPORT+="\n\n**📅 METADATA**\n"
-                REPORT+="• Discovered: $(date -u '+%Y-%m-%d %H:%M:%S UTC')\n"
-                REPORT+="• Scanner: Digital Sentinel ULTIMATE v2.0\n"
-                REPORT+="• Scan ID: ${{ github.run_id }}\n"
-                REPORT+="• AI Enhanced: $ENABLE_AI\n"
-                REPORT+="\n⚠️ **Ready for Bug Bounty Submission** ✅"
-                
+                # Send detailed report
                 curl -H "Content-Type: application/json" \
                      -d '{
                        "embeds": [{
-                         "title": "🚨 '"$VULN_NAME"'",
-                         "description": "'"$(echo "$REPORT" | sed 's/"/\\"/g')"'",
-                         "color": '"$SEVERITY_COLOR"',
-                         "footer": {"text": "Digital Sentinel ULTIMATE | Bug Bounty Ready"},
+                         "title": "🐛 '"$VULN_NAME"'",
+                         "description": "**Type:** '"$VULN_TYPE"'\n**Severity:** '"${SEVERITY^^}"'\n**URL:** '"$MATCHED_AT"'\n\n**Description:**\n'"$DESCRIPTION"''"$AI_ANALYSIS"'",
+                         "color": '"$SEV_COLOR"',
+                         "fields": [
+                           {"name": "🎯 Target", "value": "'"$TARGET"'", "inline": true},
+                           {"name": "🔥 Severity", "value": "'"${SEVERITY^^}"'", "inline": true},
+                           {"name": "📅 Discovered", "value": "'"$(date +%Y-%m-%d)"'", "inline": true}
+                         ],
+                         "footer": {"text": "Scan ID: '"$SCAN_ID"' | Ready for Bug Bounty Submission"},
                          "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
                        }]
                      }' \
@@ -338,7 +389,7 @@ Provide:
               done < nuclei.json
             fi
           else
-            echo "✅ No vulnerabilities found - skipping Discord notification"
+            echo "✅ No notification sent (mode: $NOTIFICATION_MODE, vulns: $VULN)"
           fi
       
       - name: 📊 Summary
@@ -349,19 +400,47 @@ Provide:
           URLS="${{ steps.crawl.outputs.count }}"
           VULN="${{ steps.nuclei.outputs.count }}"
           ENABLE_AI="${{ steps.target.outputs.enable_ai }}"
+          NOTIFICATION_MODE="${{ steps.target.outputs.notification_mode }}"
           
           echo "## 🔥 Scan Complete: $TARGET" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 🔍 Subdomains: $SUBS" >> $GITHUB_STEP_SUMMARY
-          echo "- 🌐 Live: $LIVE" >> $GITHUB_STEP_SUMMARY
-          echo "- 🕷️ URLs: $URLS" >> $GITHUB_STEP_SUMMARY
-          echo "- 🐛 Vulnerabilities: $VULN" >> $GITHUB_STEP_SUMMARY
-          echo "- 🤖 AI Analysis: $ENABLE_AI" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔍 **Subdomains:** $SUBS" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 **Live Hosts:** $LIVE" >> $GITHUB_STEP_SUMMARY
+          echo "- 🕷️ **URLs Discovered:** $URLS" >> $GITHUB_STEP_SUMMARY
+          echo "- 🐛 **Vulnerabilities:** $VULN" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚙️ Configuration:" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚡ **Intensity:** ${{ steps.target.outputs.intensity }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🤖 **AI Analysis:** $ENABLE_AI" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔔 **Notification Mode:** $NOTIFICATION_MODE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "$VULN" -gt "0" ]; then
+            echo "### 🚨 Vulnerabilities Detected!" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "📋 **Detailed reports sent to Discord with AI analysis**" >> $GITHUB_STEP_SUMMARY
+            echo "**Detailed reports have been sent to Discord.**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review findings in Discord" >> $GITHUB_STEP_SUMMARY
+            echo "2. Verify vulnerabilities manually" >> $GITHUB_STEP_SUMMARY
+            echo "3. Prepare bug bounty report" >> $GITHUB_STEP_SUMMARY
+            echo "4. Submit to appropriate platform" >> $GITHUB_STEP_SUMMARY
           else
+            echo "### ✅ No Vulnerabilities Found" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **No vulnerabilities found - no Discord notification sent**" >> $GITHUB_STEP_SUMMARY
+            echo "The target appears to be secure against common vulnerabilities." >> $GITHUB_STEP_SUMMARY
           fi
+      
+      - name: 📦 Upload Artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: scan-results-${{ steps.target.outputs.target }}-${{ steps.target.outputs.scan_id }}
+          path: |
+            subs.txt
+            live.txt
+            urls.txt
+            nuclei.json
+            results.txt
+          retention-days: 90
