@@ -1,0 +1,105 @@
+name: 🧠 Master Sentinel ULTIMATE
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets_file:
+        description: 'Targets file URL or paste targets (one per line)'
+        required: true
+        type: string
+      intensity:
+        description: 'Scan intensity (1=Fast, 2=Balanced, 3=Deep)'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+      enable_ai:
+        description: 'Enable AI Analysis (Gemini)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: 📥 Get Targets
+        id: targets
+        run: |
+          TARGETS_INPUT="${{ github.event.inputs.targets_file }}"
+          INTENSITY="${{ github.event.inputs.intensity }}"
+          ENABLE_AI="${{ github.event.inputs.enable_ai }}"
+          
+          if [ -z "$TARGETS_INPUT" ]; then
+            echo "example.com" > targets.txt
+            echo "testphp.vulnweb.com" >> targets.txt
+          elif [[ "$TARGETS_INPUT" =~ ^https?:// ]]; then
+            curl -sL "$TARGETS_INPUT" -o targets.txt || echo "$TARGETS_INPUT" > targets.txt
+          else
+            echo "$TARGETS_INPUT" > targets.txt
+          fi
+          
+          COUNT=$(wc -l < targets.txt)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "intensity=${INTENSITY:-2}" >> $GITHUB_OUTPUT
+          echo "enable_ai=${ENABLE_AI:-true}" >> $GITHUB_OUTPUT
+          echo "🎯 Loaded $COUNT targets | Intensity: ${INTENSITY:-2} | AI: ${ENABLE_AI:-true}"
+      
+      - name: 🚀 Dispatch Workers
+        run: |
+          INTENSITY="${{ steps.targets.outputs.intensity }}"
+          ENABLE_AI="${{ steps.targets.outputs.enable_ai }}"
+          BATCH_SIZE=50
+          BATCH_NUM=0
+          
+          while IFS= read -r target || [ -n "$target" ]; do
+            [ -z "$target" ] && continue
+            
+            curl -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{
+                "event_type": "scan_target",
+                "client_payload": {
+                  "target": "'"$target"'",
+                  "intensity": "'"$INTENSITY"'",
+                  "enable_ai": "'"$ENABLE_AI"'"
+                }
+              }' 2>/dev/null || true
+            
+            sleep 1
+            
+            if [ $((++BATCH_NUM % BATCH_SIZE)) -eq 0 ]; then
+              echo "⏸️ Batch cooldown..."
+              sleep 30
+            fi
+          done < targets.txt
+          
+          echo "✅ All workers dispatched"
+      
+      - name: 📊 Summary
+        run: |
+          COUNT="${{ steps.targets.outputs.count }}"
+          INTENSITY="${{ steps.targets.outputs.intensity }}"
+          ENABLE_AI="${{ steps.targets.outputs.enable_ai }}"
+          
+          echo "## 🧠 Master Sentinel ULTIMATE Activated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎯 Targets: $COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚡ Intensity: $INTENSITY" >> $GITHUB_STEP_SUMMARY
+          echo "- 🤖 AI Analysis: $ENABLE_AI" >> $GITHUB_STEP_SUMMARY
+          echo "- 📡 Workers: Dispatched" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔔 Discord notifications will only be sent when vulnerabilities are found" >> $GITHUB_STEP_SUMMARY
+          echo "📋 Each vulnerability will include: POC, Remediation, CVSS, CWE, AI Analysis" >> $GITHUB_STEP_SUMMARY
