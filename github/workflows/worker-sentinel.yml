@@ -1,0 +1,161 @@
+name: 🔥 Worker Sentinel ULTIMATE
+
+on:
+  repository_dispatch:
+    types: [scan_target]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target domain'
+        required: true
+        type: string
+      intensity:
+        description: 'Scan intensity (1-3)'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+      enable_ai:
+        description: 'Enable AI Analysis'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    steps:
+      - name: 🎯 Get Target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" == "repository_dispatch" ]; then
+            TARGET="${{ github.event.client_payload.target }}"
+            INTENSITY="${{ github.event.client_payload.intensity }}"
+            ENABLE_AI="${{ github.event.client_payload.enable_ai }}"
+          else
+            TARGET="${{ github.event.inputs.target }}"
+            INTENSITY="${{ github.event.inputs.intensity }}"
+            ENABLE_AI="${{ github.event.inputs.enable_ai }}"
+          fi
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "intensity=${INTENSITY:-2}" >> $GITHUB_OUTPUT
+          echo "enable_ai=${ENABLE_AI:-true}" >> $GITHUB_OUTPUT
+          echo "🎯 Target: $TARGET | Intensity: ${INTENSITY:-2} | AI: ${ENABLE_AI:-true}"
+      
+      - name: 🔧 Install Tools
+        run: |
+          wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+          export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+          echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
+          
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest &
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest &
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest &
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest &
+          wait
+          
+          echo "✅ Tools installed"
+      
+      - name: 🔍 Subdomain Discovery
+        id: subdomains
+        run: |
+          TARGET="${{ steps.target.outputs.target }}"
+          INTENSITY="${{ steps.target.outputs.intensity }}"
+          
+          if [ "$INTENSITY" -ge "3" ]; then
+            TIMEOUT=10
+          elif [ "$INTENSITY" -ge "2" ]; then
+            TIMEOUT=5
+          else
+            TIMEOUT=3
+          fi
+          
+          subfinder -d $TARGET -silent -max-time $TIMEOUT -o subs.txt 2>/dev/null || echo "$TARGET" > subs.txt
+          
+          # Add target itself if not found
+          echo "$TARGET" >> subs.txt
+          echo "www.$TARGET" >> subs.txt
+          
+          sort -u subs.txt -o subs.txt
+          COUNT=$(wc -l < subs.txt)
+          echo "✅ Subdomains: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+      
+      - name: 🌐 HTTP Probing
+        id: http
+        run: |
+          INTENSITY="${{ steps.target.outputs.intensity }}"
+          
+          if [ "$INTENSITY" -ge "3" ]; then
+            THREADS=50
+          elif [ "$INTENSITY" -ge "2" ]; then
+            THREADS=30
+          else
+            THREADS=20
+          fi
+          
+          cat subs.txt | httpx -silent -timeout 10 -threads $THREADS -follow-redirects -o live.txt 2>/dev/null || cp subs.txt live.txt
+          
+          # If no live hosts, try adding http/https
+          if [ ! -s live.txt ]; then
+            TARGET="${{ steps.target.outputs.target }}"
+            echo "http://$TARGET" > live.txt
+            echo "https://$TARGET" >> live.txt
+          fi
+          
+          COUNT=$(wc -l < live.txt)
+          echo "✅ Live hosts: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+      
+      - name: 🕷️ Crawling & URL Discovery
+        id: crawl
+        run: |
+          INTENSITY="${{ steps.target.outputs.intensity }}"
+          
+          if [ "$INTENSITY" -ge "3" ]; then
+            DEPTH=3
+          elif [ "$INTENSITY" -ge "2" ]; then
+            DEPTH=2
+          else
+            DEPTH=1
+          fi
+          
+          cat live.txt | head -5 | katana -silent -depth $DEPTH -timeout 10 -o urls.txt 2>/dev/null || cp live.txt urls.txt
+          
+          COUNT=$(wc -l < urls.txt)
+          echo "✅ URLs discovered: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+      
+      - name: 🔎 Nuclei Scan
+        id: nuclei
+        run: |
+          INTENSITY="${{ steps.target.outputs.intensity }}"
+          
+          nuclei -update-templates -silent 2>/dev/null || true
+          
+          if [ "$INTENSITY" -ge "3" ]; then
+            SEV="critical,high,medium,low,info"
+            RATE=150
+          elif [ "$INTENSITY" -ge "2" ]; then
+            SEV="critical,high,medium"
+            RATE=100
+          else
+            SEV="critical,high"
+            RATE=50
+          fi
+          
+          cat live.txt | nuclei -silent -severity $SEV -timeout 15 -rate-limit $RATE -json -o nuclei.json 2>/dev/null || touch nuclei.json
+          cat live.txt | nuclei -silent -severity $SEV -timeout 15 -rate-limit $RATE -o results.txt 2>/dev/null || touch results.txt
+          
+          COUNT=$(wc -l < results.txt)
+          echo "✅ Nuclei findings: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
